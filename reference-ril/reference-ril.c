@@ -15,7 +15,7 @@
 ** limitations under the License.
 */
 
-#include <telephony/ril.h>
+#include <telephony/ril_cdma_sms.h>
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -33,6 +33,10 @@
 #include <sys/socket.h>
 #include <cutils/sockets.h>
 #include <termios.h>
+#include <sys/system_properties.h>
+
+#include "ril.h"
+#include "hardware/qemu_pipe.h"
 
 #define LOG_TAG "RIL"
 #include <utils/Log.h>
@@ -40,7 +44,7 @@
 #define MAX_AT_RESPONSE 0x1000
 
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
-#define PPP_TTY_PATH "/dev/omap_csmi_tty1"
+#define PPP_TTY_PATH "eth0"
 
 #ifdef USE_TI_COMMANDS
 
@@ -56,14 +60,104 @@
 #define WORKAROUND_FAKE_CGEV 1
 #endif
 
+/* Modem Technology bits */
+#define MDM_GSM         0x01
+#define MDM_WCDMA       0x02
+#define MDM_CDMA        0x04
+#define MDM_EVDO        0x08
+#define MDM_LTE         0x10
+
+typedef struct {
+    int supportedTechs; // Bitmask of supported Modem Technology bits
+    int currentTech;    // Technology the modem is currently using (in the format used by modem)
+    int isMultimode;
+
+    // Preferred mode bitmask. This is actually 4 byte-sized bitmasks with different priority values,
+    // in which the byte number from LSB to MSB give the priority.
+    //
+    //          |MSB|   |   |LSB
+    // value:   |00 |00 |00 |00
+    // byte #:  |3  |2  |1  |0
+    //
+    // Higher byte order give higher priority. Thus, a value of 0x0000000f represents
+    // a preferred mode of GSM, WCDMA, CDMA, and EvDo in which all are equally preferrable, whereas
+    // 0x00000201 represents a mode with GSM and WCDMA, in which WCDMA is preferred over GSM
+    int32_t preferredNetworkMode;
+    int subscription_source;
+
+} ModemInfo;
+
+static ModemInfo *sMdmInfo;
+// TECH returns the current technology in the format used by the modem.
+// It can be used as an l-value
+#define TECH(mdminfo)                 ((mdminfo)->currentTech)
+// TECH_BIT returns the bitmask equivalent of the current tech
+#define TECH_BIT(mdminfo)            (1 << ((mdminfo)->currentTech))
+#define IS_MULTIMODE(mdminfo)         ((mdminfo)->isMultimode)
+#define TECH_SUPPORTED(mdminfo, tech) ((mdminfo)->supportedTechs & (tech))
+#define PREFERRED_NETWORK(mdminfo)    ((mdminfo)->preferredNetworkMode)
+// CDMA Subscription Source
+#define SSOURCE(mdminfo)              ((mdminfo)->subscription_source)
+
+static int net2modem[] = {
+    MDM_GSM | MDM_WCDMA,                                 // 0  - GSM / WCDMA Pref
+    MDM_GSM,                                             // 1  - GSM only
+    MDM_WCDMA,                                           // 2  - WCDMA only
+    MDM_GSM | MDM_WCDMA,                                 // 3  - GSM / WCDMA Auto
+    MDM_CDMA | MDM_EVDO,                                 // 4  - CDMA / EvDo Auto
+    MDM_CDMA,                                            // 5  - CDMA only
+    MDM_EVDO,                                            // 6  - EvDo only
+    MDM_GSM | MDM_WCDMA | MDM_CDMA | MDM_EVDO,           // 7  - GSM/WCDMA, CDMA, EvDo
+    MDM_LTE | MDM_CDMA | MDM_EVDO,                       // 8  - LTE, CDMA and EvDo
+    MDM_LTE | MDM_GSM | MDM_WCDMA,                       // 9  - LTE, GSM/WCDMA
+    MDM_LTE | MDM_CDMA | MDM_EVDO | MDM_GSM | MDM_WCDMA, // 10 - LTE, CDMA, EvDo, GSM/WCDMA
+    MDM_LTE,                                             // 11 - LTE only
+};
+
+static int32_t net2pmask[] = {
+    MDM_GSM | (MDM_WCDMA << 8),                          // 0  - GSM / WCDMA Pref
+    MDM_GSM,                                             // 1  - GSM only
+    MDM_WCDMA,                                           // 2  - WCDMA only
+    MDM_GSM | MDM_WCDMA,                                 // 3  - GSM / WCDMA Auto
+    MDM_CDMA | MDM_EVDO,                                 // 4  - CDMA / EvDo Auto
+    MDM_CDMA,                                            // 5  - CDMA only
+    MDM_EVDO,                                            // 6  - EvDo only
+    MDM_GSM | MDM_WCDMA | MDM_CDMA | MDM_EVDO,           // 7  - GSM/WCDMA, CDMA, EvDo
+    MDM_LTE | MDM_CDMA | MDM_EVDO,                       // 8  - LTE, CDMA and EvDo
+    MDM_LTE | MDM_GSM | MDM_WCDMA,                       // 9  - LTE, GSM/WCDMA
+    MDM_LTE | MDM_CDMA | MDM_EVDO | MDM_GSM | MDM_WCDMA, // 10 - LTE, CDMA, EvDo, GSM/WCDMA
+    MDM_LTE,                                             // 11 - LTE only
+};
+
+static int is3gpp2(int radioTech) {
+    switch (radioTech) {
+        case RADIO_TECH_IS95A:
+        case RADIO_TECH_IS95B:
+        case RADIO_TECH_1xRTT:
+        case RADIO_TECH_EVDO_0:
+        case RADIO_TECH_EVDO_A:
+        case RADIO_TECH_EVDO_B:
+        case RADIO_TECH_EHRPD:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 typedef enum {
     SIM_ABSENT = 0,
     SIM_NOT_READY = 1,
     SIM_READY = 2, /* SIM_READY means the radio state is RADIO_STATE_SIM_READY */
     SIM_PIN = 3,
     SIM_PUK = 4,
-    SIM_NETWORK_PERSONALIZATION = 5
-} SIM_Status; 
+    SIM_NETWORK_PERSONALIZATION = 5,
+    RUIM_ABSENT = 6,
+    RUIM_NOT_READY = 7,
+    RUIM_READY = 8,
+    RUIM_PIN = 9,
+    RUIM_PUK = 10,
+    RUIM_NETWORK_PERSONALIZATION = 11
+} SIM_Status;
 
 static void onRequest (int request, void *data, size_t datalen, RIL_Token t);
 static RIL_RadioState currentState();
@@ -72,8 +166,8 @@ static void onCancel (RIL_Token t);
 static const char *getVersion();
 static int isRadioOn();
 static SIM_Status getSIMStatus();
-static int getCardStatus(RIL_CardStatus **pp_card_status);
-static void freeCardStatus(RIL_CardStatus *p_card_status);
+static int getCardStatus(RIL_CardStatus_v6 **pp_card_status);
+static void freeCardStatus(RIL_CardStatus_v6 *p_card_status);
 static void onDataCallListChanged(void *param);
 
 extern const char * requestToString(int request);
@@ -131,6 +225,10 @@ static int s_expectAnswer = 0;
 
 static void pollSIMState (void *param);
 static void setRadioState(RIL_RadioState newState);
+static void setRadioTechnology(ModemInfo *mdm, int newtech);
+static int query_ctec(ModemInfo *mdm, int *current, int32_t *preferred);
+static int parse_technology_response(const char *response, int *current, int32_t *preferred);
+static int techFromModemType(int mdmtype);
 
 static int clccStateToRILState(int state, RIL_CallState *p_state)
 
@@ -205,7 +303,7 @@ static int callFromCLCCLine(char *line, RIL_Call *p_call)
     return 0;
 
 error:
-    LOGE("invalid CLCC line\n");
+    RLOGE("invalid CLCC line\n");
     return -1;
 }
 
@@ -270,7 +368,7 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
                 goto error;
             }
         }
-        setRadioState(RADIO_STATE_SIM_NOT_READY);
+        setRadioState(RADIO_STATE_ON);
     }
 
     at_response_free(p_response);
@@ -315,19 +413,23 @@ static void requestOrSendDataCallList(RIL_Token *t)
          p_cur = p_cur->p_next)
         n++;
 
-    RIL_Data_Call_Response *responses =
-        alloca(n * sizeof(RIL_Data_Call_Response));
+    RIL_Data_Call_Response_v6 *responses =
+        alloca(n * sizeof(RIL_Data_Call_Response_v6));
 
     int i;
     for (i = 0; i < n; i++) {
+        responses[i].status = -1;
+        responses[i].suggestedRetryTime = -1;
         responses[i].cid = -1;
         responses[i].active = -1;
         responses[i].type = "";
-        responses[i].apn = "";
-        responses[i].address = "";
+        responses[i].ifname = "";
+        responses[i].addresses = "";
+        responses[i].dnses = "";
+        responses[i].gateways = "";
     }
 
-    RIL_Data_Call_Response *response = responses;
+    RIL_Data_Call_Response_v6 *response = responses;
     for (p_cur = p_response->p_intermediates; p_cur != NULL;
          p_cur = p_cur->p_next) {
         char *line = p_cur->line;
@@ -363,10 +465,6 @@ static void requestOrSendDataCallList(RIL_Token *t)
          p_cur = p_cur->p_next) {
         char *line = p_cur->line;
         int cid;
-        char *type;
-        char *apn;
-        char *address;
-
 
         err = at_tok_start(&line);
         if (err < 0)
@@ -386,37 +484,88 @@ static void requestOrSendDataCallList(RIL_Token *t)
             continue;
         }
 
+        // Assume no error
+        responses[i].status = 0;
+
+        // type
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
-
         responses[i].type = alloca(strlen(out) + 1);
         strcpy(responses[i].type, out);
 
+        // APN ignored for v5
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
 
-        responses[i].apn = alloca(strlen(out) + 1);
-        strcpy(responses[i].apn, out);
+        responses[i].ifname = alloca(strlen(PPP_TTY_PATH) + 1);
+        strcpy(responses[i].ifname, PPP_TTY_PATH);
 
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
 
-        responses[i].address = alloca(strlen(out) + 1);
-        strcpy(responses[i].address, out);
+        responses[i].addresses = alloca(strlen(out) + 1);
+        strcpy(responses[i].addresses, out);
+
+        {
+            char  propValue[PROP_VALUE_MAX];
+
+            if (__system_property_get("ro.kernel.qemu", propValue) != 0) {
+                /* We are in the emulator - the dns servers are listed
+                 * by the following system properties, setup in
+                 * /system/etc/init.goldfish.sh:
+                 *  - net.eth0.dns1
+                 *  - net.eth0.dns2
+                 *  - net.eth0.dns3
+                 *  - net.eth0.dns4
+                 */
+                const int   dnslist_sz = 128;
+                char*       dnslist = alloca(dnslist_sz);
+                const char* separator = "";
+                int         nn;
+
+                dnslist[0] = 0;
+                for (nn = 1; nn <= 4; nn++) {
+                    /* Probe net.eth0.dns<n> */
+                    char  propName[PROP_NAME_MAX];
+                    snprintf(propName, sizeof propName, "net.eth0.dns%d", nn);
+
+                    /* Ignore if undefined */
+                    if (__system_property_get(propName, propValue) == 0) {
+                        continue;
+                    }
+
+                    /* Append the DNS IP address */
+                    strlcat(dnslist, separator, dnslist_sz);
+                    strlcat(dnslist, propValue, dnslist_sz);
+                    separator = " ";
+                }
+                responses[i].dnses = dnslist;
+
+                /* There is only on gateway in the emulator */
+                responses[i].gateways = "10.0.2.2";
+            }
+            else {
+                /* I don't know where we are, so use the public Google DNS
+                 * servers by default and no gateway.
+                 */
+                responses[i].dnses = "8.8.8.8 8.8.4.4";
+                responses[i].gateways = "";
+            }
+        }
     }
 
     at_response_free(p_response);
 
     if (t != NULL)
         RIL_onRequestComplete(*t, RIL_E_SUCCESS, responses,
-                              n * sizeof(RIL_Data_Call_Response));
+                              n * sizeof(RIL_Data_Call_Response_v6));
     else
         RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
                                   responses,
-                                  n * sizeof(RIL_Data_Call_Response));
+                                  n * sizeof(RIL_Data_Call_Response_v6));
 
     return;
 
@@ -463,7 +612,7 @@ static void requestQueryNetworkSelectionMode(
     return;
 error:
     at_response_free(p_response);
-    LOGE("requestQueryNetworkSelectionMode must never return error when radio is on");
+    RLOGE("requestQueryNetworkSelectionMode must never return error when radio is on");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
 
@@ -564,7 +713,7 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
                     && p_calls[i].state == RIL_CALL_ACTIVE
                     && s_repollCallsCount < REPOLL_CALLS_COUNT_MAX
             ) {
-                LOGI(
+                RLOGI(
                     "Hit WORKAROUND_ERRONOUS_ANSWER case."
                     " Repoll count: %d\n", s_repollCallsCount);
                 s_repollCallsCount++;
@@ -676,8 +825,10 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
 {
     ATResponse *p_response = NULL;
     int err;
-    int response[2];
     char *line;
+    int count =0;
+    int numofElements=sizeof(RIL_SignalStrength_v6)/sizeof(int);
+    int response[numofElements];
 
     err = at_send_command_singleline("AT+CSQ", "+CSQ:", &p_response);
 
@@ -691,11 +842,10 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
     err = at_tok_start(&line);
     if (err < 0) goto error;
 
-    err = at_tok_nextint(&line, &(response[0]));
-    if (err < 0) goto error;
-
-    err = at_tok_nextint(&line, &(response[1]));
-    if (err < 0) goto error;
+    for (count =0; count < numofElements; count ++) {
+        err = at_tok_nextint(&line, &(response[count]));
+        if (err < 0) goto error;
+    }
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
 
@@ -703,12 +853,138 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
     return;
 
 error:
-    LOGE("requestSignalStrength must never return an error when radio is on");
+    RLOGE("requestSignalStrength must never return an error when radio is on");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
 }
 
-static void requestRegistrationState(int request, void *data,
+/**
+ * networkModePossible. Decides whether the network mode is appropriate for the
+ * specified modem
+ */
+static int networkModePossible(ModemInfo *mdm, int nm)
+{
+    if ((net2modem[nm] & mdm->supportedTechs) == net2modem[nm]) {
+       return 1;
+    }
+    return 0;
+}
+static void requestSetPreferredNetworkType( int request, void *data,
+                                            size_t datalen, RIL_Token t )
+{
+    ATResponse *p_response = NULL;
+    char *cmd = NULL;
+    int value = *(int *)data;
+    int current, old;
+    int err;
+    int32_t preferred = net2pmask[value];
+
+    RLOGD("requestSetPreferredNetworkType: current: %x. New: %x", PREFERRED_NETWORK(sMdmInfo), preferred);
+    if (!networkModePossible(sMdmInfo, value)) {
+        RIL_onRequestComplete(t, RIL_E_MODE_NOT_SUPPORTED, NULL, 0);
+        return;
+    }
+    if (query_ctec(sMdmInfo, &current, NULL) < 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
+    old = PREFERRED_NETWORK(sMdmInfo);
+    RLOGD("old != preferred: %d", old != preferred);
+    if (old != preferred) {
+        asprintf(&cmd, "AT+CTEC=%d,\"%x\"", current, preferred);
+        RLOGD("Sending command: <%s>", cmd);
+        err = at_send_command_singleline(cmd, "+CTEC:", &p_response);
+        free(cmd);
+        if (err || !p_response->success) {
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            return;
+        }
+        PREFERRED_NETWORK(sMdmInfo) = value;
+        if (!strstr( p_response->p_intermediates->line, "DONE") ) {
+            int current;
+            int res = parse_technology_response(p_response->p_intermediates->line, &current, NULL);
+            switch (res) {
+                case -1: // Error or unable to parse
+                    break;
+                case 1: // Only able to parse current
+                case 0: // Both current and preferred were parsed
+                    setRadioTechnology(sMdmInfo, current);
+                    break;
+            }
+        }
+    }
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+}
+
+static void requestGetPreferredNetworkType(int request, void *data,
+                                   size_t datalen, RIL_Token t)
+{
+    int preferred;
+    unsigned i;
+
+    switch ( query_ctec(sMdmInfo, NULL, &preferred) ) {
+        case -1: // Error or unable to parse
+        case 1: // Only able to parse current
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            break;
+        case 0: // Both current and preferred were parsed
+            for ( i = 0 ; i < sizeof(net2pmask) / sizeof(int32_t) ; i++ ) {
+                if (preferred == net2pmask[i]) {
+                    RIL_onRequestComplete(t, RIL_E_SUCCESS, &i, sizeof(int));
+                    return;
+                }
+            }
+            RLOGE("Unknown preferred mode received from modem: %d", preferred);
+            RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+            break;
+    }
+
+}
+
+static void requestCdmaPrlVersion(int request, void *data,
+                                   size_t datalen, RIL_Token t)
+{
+    int err;
+    char * responseStr;
+    ATResponse *p_response = NULL;
+    const char *cmd;
+    char *line;
+
+    err = at_send_command_singleline("AT+WPRL?", "+WPRL:", &p_response);
+    if (err < 0 || !p_response->success) goto error;
+    line = p_response->p_intermediates->line;
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
+    err = at_tok_nextstr(&line, &responseStr);
+    if (err < 0 || !responseStr) goto error;
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, strlen(responseStr));
+    at_response_free(p_response);
+    return;
+error:
+    at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaBaseBandVersion(int request, void *data,
+                                   size_t datalen, RIL_Token t)
+{
+    int err;
+    char * responseStr;
+    ATResponse *p_response = NULL;
+    const char *cmd;
+    const char *prefix;
+    char *line, *p;
+    int commas;
+    int skip;
+    int count = 4;
+
+    // Fixed values. TODO: query modem
+    responseStr = strdup("1.0.0.0");
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, sizeof(responseStr));
+    free(responseStr);
+}
+
+static void requestCdmaDeviceIdentity(int request, void *data,
                                         size_t datalen, RIL_Token t)
 {
     int err;
@@ -720,26 +996,184 @@ static void requestRegistrationState(int request, void *data,
     char *line, *p;
     int commas;
     int skip;
-    int count = 3;
+    int count = 4;
 
+    // Fixed values. TODO: Query modem
+    responseStr[0] = "----";
+    responseStr[1] = "----";
+    responseStr[2] = "77777777";
 
-    if (request == RIL_REQUEST_REGISTRATION_STATE) {
-        cmd = "AT+CREG?";
-        prefix = "+CREG:";
-    } else if (request == RIL_REQUEST_GPRS_REGISTRATION_STATE) {
-        cmd = "AT+CGREG?";
-        prefix = "+CGREG:";
+    err = at_send_command_numeric("AT+CGSN", &p_response);
+    if (err < 0 || p_response->success == 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
     } else {
-        assert(0);
-        goto error;
+        responseStr[3] = p_response->p_intermediates->line;
     }
 
-    err = at_send_command_singleline(cmd, prefix, &p_response);
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
+    at_response_free(p_response);
 
-    if (err != 0) goto error;
+    return;
+error:
+    RLOGE("requestCdmaDeviceIdentity must never return an error when radio is on");
+    at_response_free(p_response);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaGetSubscriptionSource(int request, void *data,
+                                        size_t datalen, RIL_Token t)
+{
+    int err;
+    int *ss = (int *)data;
+    ATResponse *p_response = NULL;
+    char *cmd = NULL;
+    char *line = NULL;
+    int response;
+
+    asprintf(&cmd, "AT+CCSS?");
+    if (!cmd) goto error;
+
+    err = at_send_command_singleline(cmd, "+CCSS:", &p_response);
+    if (err < 0 || !p_response->success)
+        goto error;
 
     line = p_response->p_intermediates->line;
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
 
+    err = at_tok_nextint(&line, &response);
+    free(cmd);
+    cmd = NULL;
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+
+    return;
+error:
+    free(cmd);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaSetSubscriptionSource(int request, void *data,
+                                        size_t datalen, RIL_Token t)
+{
+    int err;
+    int *ss = (int *)data;
+    ATResponse *p_response = NULL;
+    char *cmd = NULL;
+
+    if (!ss || !datalen) {
+        RLOGE("RIL_REQUEST_CDMA_SET_SUBSCRIPTION without data!");
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
+    asprintf(&cmd, "AT+CCSS=%d", ss[0]);
+    if (!cmd) goto error;
+
+    err = at_send_command(cmd, &p_response);
+    if (err < 0 || !p_response->success)
+        goto error;
+    free(cmd);
+    cmd = NULL;
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+
+    RIL_onUnsolicitedResponse(RIL_UNSOL_CDMA_SUBSCRIPTION_SOURCE_CHANGED, ss, sizeof(ss[0]));
+
+    return;
+error:
+    free(cmd);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaSubscription(int request, void *data,
+                                        size_t datalen, RIL_Token t)
+{
+    int err;
+    int response[5];
+    char * responseStr[5];
+    ATResponse *p_response = NULL;
+    const char *cmd;
+    const char *prefix;
+    char *line, *p;
+    int commas;
+    int skip;
+    int count = 5;
+
+    // Fixed values. TODO: Query modem
+    responseStr[0] = "8587777777"; // MDN
+    responseStr[1] = "1"; // SID
+    responseStr[2] = "1"; // NID
+    responseStr[3] = "8587777777"; // MIN
+    responseStr[4] = "1"; // PRL Version
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
+
+    return;
+error:
+    RLOGE("requestRegistrationState must never return an error when radio is on");
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaGetRoamingPreference(int request, void *data,
+                                                 size_t datalen, RIL_Token t)
+{
+    int roaming_pref = -1;
+    ATResponse *p_response = NULL;
+    char *line;
+    int res;
+
+    res = at_send_command_singleline("AT+WRMP?", "+WRMP:", &p_response);
+    if (res < 0 || !p_response->success) {
+        goto error;
+    }
+    line = p_response->p_intermediates->line;
+
+    res = at_tok_start(&line);
+    if (res < 0) goto error;
+
+    res = at_tok_nextint(&line, &roaming_pref);
+    if (res < 0) goto error;
+
+     RIL_onRequestComplete(t, RIL_E_SUCCESS, &roaming_pref, sizeof(roaming_pref));
+    return;
+error:
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static void requestCdmaSetRoamingPreference(int request, void *data,
+                                                 size_t datalen, RIL_Token t)
+{
+    int *pref = (int *)data;
+    ATResponse *p_response = NULL;
+    char *line;
+    int res;
+    char *cmd = NULL;
+
+    asprintf(&cmd, "AT+WRMP=%d", *pref);
+    if (cmd == NULL) goto error;
+
+    res = at_send_command(cmd, &p_response);
+    if (res < 0 || !p_response->success)
+        goto error;
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    free(cmd);
+    return;
+error:
+    free(cmd);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+}
+
+static int parseRegistrationState(char *str, int *type, int *items, int **response)
+{
+    int err;
+    char *line = str, *p;
+    int *resp = NULL;
+    int skip;
+    int count = 3;
+    int commas;
+
+    RLOGD("parseRegistrationState. Parsing: %s",str);
     err = at_tok_start(&line);
     if (err < 0) goto error;
 
@@ -770,40 +1204,42 @@ static void requestRegistrationState(int request, void *data,
         if (*p == ',') commas++;
     }
 
+    resp = (int *)calloc(commas + 1, sizeof(int));
+    if (!resp) goto error;
     switch (commas) {
         case 0: /* +CREG: <stat> */
-            err = at_tok_nextint(&line, &response[0]);
+            err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
-            response[1] = -1;
-            response[2] = -1;
+            resp[1] = -1;
+            resp[2] = -1;
         break;
 
         case 1: /* +CREG: <n>, <stat> */
             err = at_tok_nextint(&line, &skip);
             if (err < 0) goto error;
-            err = at_tok_nextint(&line, &response[0]);
+            err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
-            response[1] = -1;
-            response[2] = -1;
+            resp[1] = -1;
+            resp[2] = -1;
             if (err < 0) goto error;
         break;
 
         case 2: /* +CREG: <stat>, <lac>, <cid> */
-            err = at_tok_nextint(&line, &response[0]);
+            err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[1]);
+            err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[2]);
+            err = at_tok_nexthexint(&line, &resp[2]);
             if (err < 0) goto error;
         break;
         case 3: /* +CREG: <n>, <stat>, <lac>, <cid> */
             err = at_tok_nextint(&line, &skip);
             if (err < 0) goto error;
-            err = at_tok_nextint(&line, &response[0]);
+            err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[1]);
+            err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[2]);
+            err = at_tok_nexthexint(&line, &resp[2]);
             if (err < 0) goto error;
         break;
         /* special case for CGREG, there is a fourth parameter
@@ -812,33 +1248,143 @@ static void requestRegistrationState(int request, void *data,
         case 4: /* +CGREG: <n>, <stat>, <lac>, <cid>, <networkType> */
             err = at_tok_nextint(&line, &skip);
             if (err < 0) goto error;
-            err = at_tok_nextint(&line, &response[0]);
+            err = at_tok_nextint(&line, &resp[0]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[1]);
+            err = at_tok_nexthexint(&line, &resp[1]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[2]);
+            err = at_tok_nexthexint(&line, &resp[2]);
             if (err < 0) goto error;
-            err = at_tok_nexthexint(&line, &response[3]);
+            err = at_tok_nexthexint(&line, &resp[3]);
             if (err < 0) goto error;
             count = 4;
         break;
         default:
             goto error;
     }
+    if (response)
+        *response = resp;
+    if (items)
+        *items = commas + 1;
+    if (type)
+        *type = techFromModemType(TECH(sMdmInfo));
+    return 0;
+error:
+    free(resp);
+    return -1;
+}
 
-    asprintf(&responseStr[0], "%d", response[0]);
-    asprintf(&responseStr[1], "%x", response[1]);
-    asprintf(&responseStr[2], "%x", response[2]);
+#define REG_STATE_LEN 15
+#define REG_DATA_STATE_LEN 6
+static void requestRegistrationState(int request, void *data,
+                                        size_t datalen, RIL_Token t)
+{
+    int err;
+    int *registration;
+    char **responseStr = NULL;
+    ATResponse *p_response = NULL;
+    const char *cmd;
+    const char *prefix;
+    char *line;
+    int i = 0, j, numElements = 0;
+    int count = 3;
+    int type, startfrom;
 
-    if (count > 3)
-        asprintf(&responseStr[3], "%d", response[3]);
+    RLOGD("requestRegistrationState");
+    if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
+        cmd = "AT+CREG?";
+        prefix = "+CREG:";
+        numElements = REG_STATE_LEN;
+    } else if (request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
+        cmd = "AT+CGREG?";
+        prefix = "+CGREG:";
+        numElements = REG_DATA_STATE_LEN;
+    } else {
+        assert(0);
+        goto error;
+    }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
+    err = at_send_command_singleline(cmd, prefix, &p_response);
+
+    if (err != 0) goto error;
+
+    line = p_response->p_intermediates->line;
+
+    if (parseRegistrationState(line, &type, &count, &registration)) goto error;
+
+    responseStr = malloc(numElements * sizeof(char *));
+    if (!responseStr) goto error;
+    memset(responseStr, 0, numElements * sizeof(char *));
+    /**
+     * The first '4' bytes for both registration states remain the same.
+     * But if the request is 'DATA_REGISTRATION_STATE',
+     * the 5th and 6th byte(s) are optional.
+     */
+    if (is3gpp2(type) == 1) {
+        RLOGD("registration state type: 3GPP2");
+        // TODO: Query modem
+        startfrom = 3;
+        if(request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
+            asprintf(&responseStr[3], "8");     // EvDo revA
+            asprintf(&responseStr[4], "1");     // BSID
+            asprintf(&responseStr[5], "123");   // Latitude
+            asprintf(&responseStr[6], "222");   // Longitude
+            asprintf(&responseStr[7], "0");     // CSS Indicator
+            asprintf(&responseStr[8], "4");     // SID
+            asprintf(&responseStr[9], "65535"); // NID
+            asprintf(&responseStr[10], "0");    // Roaming indicator
+            asprintf(&responseStr[11], "1");    // System is in PRL
+            asprintf(&responseStr[12], "0");    // Default Roaming indicator
+            asprintf(&responseStr[13], "0");    // Reason for denial
+            asprintf(&responseStr[14], "0");    // Primary Scrambling Code of Current cell
+      } else if (request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
+            asprintf(&responseStr[3], "8");   // Available data radio technology
+      }
+    } else { // type == RADIO_TECH_3GPP
+        RLOGD("registration state type: 3GPP");
+        startfrom = 0;
+        asprintf(&responseStr[1], "%x", registration[1]);
+        asprintf(&responseStr[2], "%x", registration[2]);
+        if (count > 3)
+            asprintf(&responseStr[3], "%d", registration[3]);
+    }
+    asprintf(&responseStr[0], "%d", registration[0]);
+
+    /**
+     * Optional bytes for DATA_REGISTRATION_STATE request
+     * 4th byte : Registration denial code
+     * 5th byte : The max. number of simultaneous Data Calls
+     */
+    if(request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
+        // asprintf(&responseStr[4], "3");
+        // asprintf(&responseStr[5], "1");
+    }
+
+    for (j = startfrom; j < numElements; j++) {
+        if (!responseStr[i]) goto error;
+    }
+    free(registration);
+    registration = NULL;
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, numElements*sizeof(responseStr));
+    for (j = 0; j < numElements; j++ ) {
+        free(responseStr[j]);
+        responseStr[j] = NULL;
+    }
+    free(responseStr);
+    responseStr = NULL;
     at_response_free(p_response);
 
     return;
 error:
-    LOGE("requestRegistrationState must never return an error when radio is on");
+    if (responseStr) {
+        for (j = 0; j < numElements; j++) {
+            free(responseStr[j]);
+            responseStr[j] = NULL;
+        }
+        free(responseStr);
+        responseStr = NULL;
+    }
+    RLOGE("requestRegistrationState must never return an error when radio is on");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
 }
@@ -909,9 +1455,41 @@ static void requestOperator(void *data, size_t datalen, RIL_Token t)
 
     return;
 error:
-    LOGE("requestOperator must not return error when radio is on");
+    RLOGE("requestOperator must not return error when radio is on");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
+}
+
+static void requestCdmaSendSMS(void *data, size_t datalen, RIL_Token t)
+{
+    int err = 1; // Set to go to error:
+    RIL_SMS_Response response;
+    RIL_CDMA_SMS_Message* rcsm;
+
+    RLOGD("requestCdmaSendSMS datalen=%d, sizeof(RIL_CDMA_SMS_Message)=%d",
+            datalen, sizeof(RIL_CDMA_SMS_Message));
+
+    // verify data content to test marshalling/unmarshalling:
+    rcsm = (RIL_CDMA_SMS_Message*)data;
+    RLOGD("TeleserviceID=%d, bIsServicePresent=%d, \
+            uServicecategory=%d, sAddress.digit_mode=%d, \
+            sAddress.Number_mode=%d, sAddress.number_type=%d, ",
+            rcsm->uTeleserviceID,  rcsm->bIsServicePresent,
+            rcsm->uServicecategory,rcsm->sAddress.digit_mode,
+            rcsm->sAddress.number_mode,rcsm->sAddress.number_type);
+
+    if (err != 0) goto error;
+
+    // Cdma Send SMS implementation will go here:
+    // But it is not implemented yet.
+
+    memset(&response, 0, sizeof(response));
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+    return;
+
+error:
+    // Cdma Send SMS will always cause send retry error.
+    RIL_onRequestComplete(t, RIL_E_SMS_SEND_FAIL_RETRY, NULL, 0);
 }
 
 static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
@@ -960,7 +1538,6 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     char *cmd;
     int err;
     ATResponse *p_response = NULL;
-    char *response[2] = { "1", PPP_TTY_PATH };
 
     apn = ((const char **)data)[2];
 
@@ -978,23 +1555,24 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     ssize_t written, rlen;
     char status[32] = {0};
     int retry = 10;
+    const char *pdp_type;
 
-    LOGD("requesting data connection to APN '%s'", apn);
+    RLOGD("requesting data connection to APN '%s'", apn);
 
     fd = open ("/dev/qmi", O_RDWR);
     if (fd >= 0) { /* the device doesn't exist on the emulator */
 
-	    LOGD("opened the qmi device\n");
-	    asprintf(&cmd, "up:%s", apn);
-	    len = strlen(cmd);
+        RLOGD("opened the qmi device\n");
+        asprintf(&cmd, "up:%s", apn);
+        len = strlen(cmd);
 
-	    while (cur < len) {
-		    do {
-	            written = write (fd, cmd + cur, len - cur);
-	        } while (written < 0 && errno == EINTR);
+        while (cur < len) {
+            do {
+                written = write (fd, cmd + cur, len - cur);
+            } while (written < 0 && errno == EINTR);
 
-	        if (written < 0) {
-                LOGE("### ERROR writing to /dev/qmi");
+            if (written < 0) {
+                RLOGE("### ERROR writing to /dev/qmi");
                 close(fd);
                 goto error;
             }
@@ -1011,56 +1589,63 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
             } while (rlen < 0 && errno == EINTR);
 
             if (rlen < 0) {
-                LOGE("### ERROR reading from /dev/qmi");
+                RLOGE("### ERROR reading from /dev/qmi");
                 close(fd);
                 goto error;
             } else {
                 status[rlen] = '\0';
-                LOGD("### status: %s", status);
+                RLOGD("### status: %s", status);
             }
         } while (strncmp(status, "STATE=up", 8) && strcmp(status, "online") && --retry);
 
         close(fd);
 
         if (retry == 0) {
-            LOGE("### Failed to get data connection up\n");
-	        goto error;
-		}
+            RLOGE("### Failed to get data connection up\n");
+            goto error;
+        }
 
         qmistatus = system("netcfg rmnet0 dhcp");
 
-        LOGD("netcfg rmnet0 dhcp: status %d\n", qmistatus);
+        RLOGD("netcfg rmnet0 dhcp: status %d\n", qmistatus);
 
-	    if (qmistatus < 0) goto error;
+        if (qmistatus < 0) goto error;
 
-	} else {
+    } else {
 
-        asprintf(&cmd, "AT+CGDCONT=1,\"IP\",\"%s\",,0,0", apn);
-	    //FIXME check for error here
-	    err = at_send_command(cmd, NULL);
-	    free(cmd);
+        if (datalen > 6 * sizeof(char *)) {
+            pdp_type = ((const char **)data)[6];
+        } else {
+            pdp_type = "IP";
+        }
 
-	    // Set required QoS params to default
-	    err = at_send_command("AT+CGQREQ=1", NULL);
+        asprintf(&cmd, "AT+CGDCONT=1,\"%s\",\"%s\",,0,0", pdp_type, apn);
+        //FIXME check for error here
+        err = at_send_command(cmd, NULL);
+        free(cmd);
 
-	    // Set minimum QoS params to default
-	    err = at_send_command("AT+CGQMIN=1", NULL);
+        // Set required QoS params to default
+        err = at_send_command("AT+CGQREQ=1", NULL);
 
-	    // packet-domain event reporting
-	    err = at_send_command("AT+CGEREP=1,0", NULL);
+        // Set minimum QoS params to default
+        err = at_send_command("AT+CGQMIN=1", NULL);
 
-	    // Hangup anything that's happening there now
-	    err = at_send_command("AT+CGACT=1,0", NULL);
+        // packet-domain event reporting
+        err = at_send_command("AT+CGEREP=1,0", NULL);
 
-	    // Start data on PDP context 1
-	    err = at_send_command("ATD*99***1#", &p_response);
+        // Hangup anything that's happening there now
+        err = at_send_command("AT+CGACT=1,0", NULL);
 
-	    if (err < 0 || p_response->success == 0) {
-	        goto error;
-	    }
+        // Start data on PDP context 1
+        err = at_send_command("ATD*99***1#", &p_response);
+
+        if (err < 0 || p_response->success == 0) {
+            goto error;
+        }
     }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+    requestOrSendDataCallList(&t);
+
     at_response_free(p_response);
 
     return;
@@ -1082,7 +1667,7 @@ static void requestSMSAcknowledge(void *data, size_t datalen, RIL_Token t)
     } else if (ackSuccess == 0)  {
         err = at_send_command("AT+CNMA=2", NULL);
     } else {
-        LOGE("unsupported arg to RIL_REQUEST_SMS_ACKNOWLEDGE\n");
+        RLOGE("unsupported arg to RIL_REQUEST_SMS_ACKNOWLEDGE\n");
         goto error;
     }
 
@@ -1098,12 +1683,12 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
     RIL_SIM_IO_Response sr;
     int err;
     char *cmd = NULL;
-    RIL_SIM_IO *p_args;
+    RIL_SIM_IO_v6 *p_args;
     char *line;
 
     memset(&sr, 0, sizeof(sr));
 
-    p_args = (RIL_SIM_IO *)data;
+    p_args = (RIL_SIM_IO_v6 *)data;
 
     /* FIXME handle pin2 */
 
@@ -1191,6 +1776,44 @@ static void  requestSendUSSD(void *data, size_t datalen, RIL_Token t)
 
 }
 
+static void requestExitEmergencyMode(void *data, size_t datalen, RIL_Token t)
+{
+    int err;
+    ATResponse *p_response = NULL;
+
+    err = at_send_command("AT+WSOS=0", &p_response);
+
+    if (err < 0 || p_response->success == 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        return;
+    }
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+}
+
+// TODO: Use all radio types
+static int techFromModemType(int mdmtype)
+{
+    int ret = -1;
+    switch (1 << mdmtype) {
+        case MDM_CDMA:
+            ret = RADIO_TECH_1xRTT;
+            break;
+        case MDM_EVDO:
+            ret = RADIO_TECH_EVDO_A;
+            break;
+        case MDM_GSM:
+            ret = RADIO_TECH_GPRS;
+            break;
+        case MDM_WCDMA:
+            ret = RADIO_TECH_HSPA;
+            break;
+        case MDM_LTE:
+            ret = RADIO_TECH_LTE;
+            break;
+    }
+    return ret;
+}
 
 /*** Callback methods from the RIL library to us ***/
 
@@ -1212,7 +1835,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
     ATResponse *p_response;
     int err;
 
-    LOGD("onRequest: %s", requestToString(request));
+    RLOGD("onRequest: %s", requestToString(request));
 
     /* Ignore all requests except RIL_REQUEST_GET_SIM_STATUS
      * when RADIO_STATE_UNAVAILABLE.
@@ -1237,7 +1860,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
 
     switch (request) {
         case RIL_REQUEST_GET_SIM_STATUS: {
-            RIL_CardStatus *p_card_status;
+            RIL_CardStatus_v6 *p_card_status;
             char *p_buffer;
             int buffer_size;
 
@@ -1347,8 +1970,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SIGNAL_STRENGTH:
             requestSignalStrength(data, datalen, t);
             break;
-        case RIL_REQUEST_REGISTRATION_STATE:
-        case RIL_REQUEST_GPRS_REGISTRATION_STATE:
+        case RIL_REQUEST_VOICE_REGISTRATION_STATE:
+        case RIL_REQUEST_DATA_REGISTRATION_STATE:
             requestRegistrationState(request, data, datalen, t);
             break;
         case RIL_REQUEST_OPERATOR:
@@ -1368,6 +1991,9 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
         case RIL_REQUEST_SEND_SMS:
             requestSendSMS(data, datalen, t);
+            break;
+        case RIL_REQUEST_CDMA_SEND_SMS:
+            requestCdmaSendSMS(data, datalen, t);
             break;
         case RIL_REQUEST_SETUP_DATA_CALL:
             requestSetupDataCall(data, datalen, t);
@@ -1445,12 +2071,12 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             int i;
             const char ** cur;
 
-            LOGD("got OEM_HOOK_STRINGS: 0x%8p %lu", data, (long)datalen);
+            RLOGD("got OEM_HOOK_STRINGS: 0x%8p %lu", data, (long)datalen);
 
 
             for (i = (datalen / sizeof (char *)), cur = (const char **)data ;
                     i > 0 ; cur++, i --) {
-                LOGD("> '%s'", *cur);
+                RLOGD("> '%s'", *cur);
             }
 
             // echo back strings
@@ -1486,7 +2112,74 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             requestEnterSimPin(data, datalen, t);
             break;
 
+        case RIL_REQUEST_VOICE_RADIO_TECH:
+            {
+                int tech = techFromModemType(TECH(sMdmInfo));
+                if (tech < 0 )
+                    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+                else
+                    RIL_onRequestComplete(t, RIL_E_SUCCESS, &tech, sizeof(tech));
+            }
+            break;
+        case RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE:
+            requestSetPreferredNetworkType(request, data, datalen, t);
+            break;
+
+        case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE:
+            requestGetPreferredNetworkType(request, data, datalen, t);
+            break;
+
+        /* CDMA Specific Requests */
+        case RIL_REQUEST_BASEBAND_VERSION:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaBaseBandVersion(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_DEVICE_IDENTITY:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaDeviceIdentity(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_CDMA_SUBSCRIPTION:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaSubscription(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_CDMA_SET_SUBSCRIPTION_SOURCE:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaSetSubscriptionSource(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_CDMA_GET_SUBSCRIPTION_SOURCE:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaGetSubscriptionSource(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_CDMA_QUERY_ROAMING_PREFERENCE:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaGetRoamingPreference(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_CDMA_SET_ROAMING_PREFERENCE:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestCdmaSetRoamingPreference(request, data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
+        case RIL_REQUEST_EXIT_EMERGENCY_CALLBACK_MODE:
+            if (TECH_BIT(sMdmInfo) == MDM_CDMA) {
+                requestExitEmergencyMode(data, datalen, t);
+                break;
+            } // Fall-through if tech is not cdma
+
         default:
+            RLOGD("Request not supported. Tech: %d",TECH(sMdmInfo));
             RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
             break;
     }
@@ -1528,8 +2221,29 @@ static const char * getVersion(void)
 }
 
 static void
+setRadioTechnology(ModemInfo *mdm, int newtech)
+{
+    RLOGD("setRadioTechnology(%d)", newtech);
+
+    int oldtech = TECH(mdm);
+
+    if (newtech != oldtech) {
+        RLOGD("Tech change (%d => %d)", oldtech, newtech);
+        TECH(mdm) = newtech;
+        if (techFromModemType(newtech) != techFromModemType(oldtech)) {
+            int tech = techFromModemType(TECH(sMdmInfo));
+            if (tech > 0 ) {
+                RIL_onUnsolicitedResponse(RIL_UNSOL_VOICE_RADIO_TECH_CHANGED,
+                                          &tech, sizeof(tech));
+            }
+        }
+    }
+}
+
+static void
 setRadioState(RIL_RadioState newState)
 {
+    RLOGD("setRadioState(%d)", newState);
     RIL_RadioState oldState;
 
     pthread_mutex_lock(&s_state_mutex);
@@ -1564,17 +2278,15 @@ setRadioState(RIL_RadioState newState)
          * Currently, this doesn't happen, but if that changes then these
          * will need to be dispatched on the request thread
          */
-        if (sState == RADIO_STATE_SIM_READY) {
-            onSIMReady();
-        } else if (sState == RADIO_STATE_SIM_NOT_READY) {
+        if (sState == RADIO_STATE_ON) {
             onRadioPowerOn();
         }
     }
 }
 
-/** Returns SIM_NOT_READY on error */
-static SIM_Status 
-getSIMStatus()
+/** Returns RUIM_NOT_READY on error */
+static SIM_Status
+getRUIMStatus()
 {
     ATResponse *p_response = NULL;
     int err;
@@ -1649,6 +2361,84 @@ done:
     return ret;
 }
 
+/** Returns SIM_NOT_READY on error */
+static SIM_Status
+getSIMStatus()
+{
+    ATResponse *p_response = NULL;
+    int err;
+    int ret;
+    char *cpinLine;
+    char *cpinResult;
+
+    RLOGD("getSIMStatus(). sState: %d",sState);
+    if (sState == RADIO_STATE_OFF || sState == RADIO_STATE_UNAVAILABLE) {
+        ret = SIM_NOT_READY;
+        goto done;
+    }
+
+    err = at_send_command_singleline("AT+CPIN?", "+CPIN:", &p_response);
+
+    if (err != 0) {
+        ret = SIM_NOT_READY;
+        goto done;
+    }
+
+    switch (at_get_cme_error(p_response)) {
+        case CME_SUCCESS:
+            break;
+
+        case CME_SIM_NOT_INSERTED:
+            ret = SIM_ABSENT;
+            goto done;
+
+        default:
+            ret = SIM_NOT_READY;
+            goto done;
+    }
+
+    /* CPIN? has succeeded, now look at the result */
+
+    cpinLine = p_response->p_intermediates->line;
+    err = at_tok_start (&cpinLine);
+
+    if (err < 0) {
+        ret = SIM_NOT_READY;
+        goto done;
+    }
+
+    err = at_tok_nextstr(&cpinLine, &cpinResult);
+
+    if (err < 0) {
+        ret = SIM_NOT_READY;
+        goto done;
+    }
+
+    if (0 == strcmp (cpinResult, "SIM PIN")) {
+        ret = SIM_PIN;
+        goto done;
+    } else if (0 == strcmp (cpinResult, "SIM PUK")) {
+        ret = SIM_PUK;
+        goto done;
+    } else if (0 == strcmp (cpinResult, "PH-NET PIN")) {
+        return SIM_NETWORK_PERSONALIZATION;
+    } else if (0 != strcmp (cpinResult, "READY"))  {
+        /* we're treating unsupported lock types as "sim absent" */
+        ret = SIM_ABSENT;
+        goto done;
+    }
+
+    at_response_free(p_response);
+    p_response = NULL;
+    cpinResult = NULL;
+
+    ret = SIM_READY;
+
+done:
+    at_response_free(p_response);
+    return ret;
+}
+
 
 /**
  * Get the current card status.
@@ -1656,7 +2446,7 @@ done:
  * This must be freed using freeCardStatus.
  * @return: On success returns RIL_E_SUCCESS
  */
-static int getCardStatus(RIL_CardStatus **pp_card_status) {
+static int getCardStatus(RIL_CardStatus_v6 **pp_card_status) {
     static RIL_AppStatus app_status_array[] = {
         // SIM_ABSENT = 0
         { RIL_APPTYPE_UNKNOWN, RIL_APPSTATE_UNKNOWN, RIL_PERSOSUBSTATE_UNKNOWN,
@@ -1675,7 +2465,25 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
           NULL, NULL, 0, RIL_PINSTATE_ENABLED_BLOCKED, RIL_PINSTATE_UNKNOWN },
         // SIM_NETWORK_PERSONALIZATION = 5
         { RIL_APPTYPE_SIM, RIL_APPSTATE_SUBSCRIPTION_PERSO, RIL_PERSOSUBSTATE_SIM_NETWORK,
-          NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN }
+          NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN },
+        // RUIM_ABSENT = 6
+        { RIL_APPTYPE_UNKNOWN, RIL_APPSTATE_UNKNOWN, RIL_PERSOSUBSTATE_UNKNOWN,
+          NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
+        // RUIM_NOT_READY = 7
+        { RIL_APPTYPE_RUIM, RIL_APPSTATE_DETECTED, RIL_PERSOSUBSTATE_UNKNOWN,
+          NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
+        // RUIM_READY = 8
+        { RIL_APPTYPE_RUIM, RIL_APPSTATE_READY, RIL_PERSOSUBSTATE_READY,
+          NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN },
+        // RUIM_PIN = 9
+        { RIL_APPTYPE_RUIM, RIL_APPSTATE_PIN, RIL_PERSOSUBSTATE_UNKNOWN,
+          NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN },
+        // RUIM_PUK = 10
+        { RIL_APPTYPE_RUIM, RIL_APPSTATE_PUK, RIL_PERSOSUBSTATE_UNKNOWN,
+          NULL, NULL, 0, RIL_PINSTATE_ENABLED_BLOCKED, RIL_PINSTATE_UNKNOWN },
+        // RUIM_NETWORK_PERSONALIZATION = 11
+        { RIL_APPTYPE_RUIM, RIL_APPSTATE_SUBSCRIPTION_PERSO, RIL_PERSOSUBSTATE_SIM_NETWORK,
+           NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN }
     };
     RIL_CardState card_state;
     int num_apps;
@@ -1686,15 +2494,16 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
         num_apps = 0;
     } else {
         card_state = RIL_CARDSTATE_PRESENT;
-        num_apps = 1;
+        num_apps = 2;
     }
 
     // Allocate and initialize base card status.
-    RIL_CardStatus *p_card_status = malloc(sizeof(RIL_CardStatus));
+    RIL_CardStatus_v6 *p_card_status = malloc(sizeof(RIL_CardStatus_v6));
     p_card_status->card_state = card_state;
     p_card_status->universal_pin_state = RIL_PINSTATE_UNKNOWN;
     p_card_status->gsm_umts_subscription_app_index = RIL_CARD_MAX_APPS;
     p_card_status->cdma_subscription_app_index = RIL_CARD_MAX_APPS;
+    p_card_status->ims_subscription_app_index = RIL_CARD_MAX_APPS;
     p_card_status->num_applications = num_apps;
 
     // Initialize application status
@@ -1707,11 +2516,13 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
     // that reflects sim_status for gsm.
     if (num_apps != 0) {
         // Only support one app, gsm
-        p_card_status->num_applications = 1;
+        p_card_status->num_applications = 2;
         p_card_status->gsm_umts_subscription_app_index = 0;
+        p_card_status->cdma_subscription_app_index = 1;
 
         // Get the correct app status
         p_card_status->applications[0] = app_status_array[sim_status];
+        p_card_status->applications[1] = app_status_array[sim_status + RUIM_ABSENT];
     }
 
     *pp_card_status = p_card_status;
@@ -1721,7 +2532,7 @@ static int getCardStatus(RIL_CardStatus **pp_card_status) {
 /**
  * Free the card status returned by getCardStatus
  */
-static void freeCardStatus(RIL_CardStatus *p_card_status) {
+static void freeCardStatus(RIL_CardStatus_v6 *p_card_status) {
     free(p_card_status);
 }
 
@@ -1747,7 +2558,8 @@ static void pollSIMState (void *param)
         case SIM_PUK:
         case SIM_NETWORK_PERSONALIZATION:
         default:
-            setRadioState(RADIO_STATE_SIM_LOCKED_OR_ABSENT);
+            RLOGI("SIM ABSENT or LOCKED");
+            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
         return;
 
         case SIM_NOT_READY:
@@ -1755,7 +2567,9 @@ static void pollSIMState (void *param)
         return;
 
         case SIM_READY:
-            setRadioState(RADIO_STATE_SIM_READY);
+            RLOGI("SIM_READY");
+            onSIMReady();
+            RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
         return;
     }
 }
@@ -1794,6 +2608,168 @@ error:
 }
 
 /**
+ * Parse the response generated by a +CTEC AT command
+ * The values read from the response are stored in current and preferred.
+ * Both current and preferred may be null. The corresponding value is ignored in that case.
+ *
+ * @return: -1 if some error occurs (or if the modem doesn't understand the +CTEC command)
+ *          1 if the response includes the current technology only
+ *          0 if the response includes both current technology and preferred mode
+ */
+int parse_technology_response( const char *response, int *current, int32_t *preferred )
+{
+    int err;
+    char *line, *p;
+    int ct;
+    int32_t pt = 0;
+    char *str_pt;
+
+    line = p = strdup(response);
+    RLOGD("Response: %s", line);
+    err = at_tok_start(&p);
+    if (err || !at_tok_hasmore(&p)) {
+        RLOGD("err: %d. p: %s", err, p);
+        free(line);
+        return -1;
+    }
+
+    err = at_tok_nextint(&p, &ct);
+    if (err) {
+        free(line);
+        return -1;
+    }
+    if (current) *current = ct;
+
+    RLOGD("line remaining after int: %s", p);
+
+    err = at_tok_nexthexint(&p, &pt);
+    if (err) {
+        free(line);
+        return 1;
+    }
+    if (preferred) {
+        *preferred = pt;
+    }
+    free(line);
+
+    return 0;
+}
+
+int query_supported_techs( ModemInfo *mdm, int *supported )
+{
+    ATResponse *p_response;
+    int err, val, techs = 0;
+    char *tok;
+    char *line;
+
+    RLOGD("query_supported_techs");
+    err = at_send_command_singleline("AT+CTEC=?", "+CTEC:", &p_response);
+    if (err || !p_response->success)
+        goto error;
+    line = p_response->p_intermediates->line;
+    err = at_tok_start(&line);
+    if (err || !at_tok_hasmore(&line))
+        goto error;
+    while (!at_tok_nextint(&line, &val)) {
+        techs |= ( 1 << val );
+    }
+    if (supported) *supported = techs;
+    return 0;
+error:
+    at_response_free(p_response);
+    return -1;
+}
+
+/**
+ * query_ctec. Send the +CTEC AT command to the modem to query the current
+ * and preferred modes. It leaves values in the addresses pointed to by
+ * current and preferred. If any of those pointers are NULL, the corresponding value
+ * is ignored, but the return value will still reflect if retreiving and parsing of the
+ * values suceeded.
+ *
+ * @mdm Currently unused
+ * @current A pointer to store the current mode returned by the modem. May be null.
+ * @preferred A pointer to store the preferred mode returned by the modem. May be null.
+ * @return -1 on error (or failure to parse)
+ *         1 if only the current mode was returned by modem (or failed to parse preferred)
+ *         0 if both current and preferred were returned correctly
+ */
+int query_ctec(ModemInfo *mdm, int *current, int32_t *preferred)
+{
+    ATResponse *response = NULL;
+    int err;
+    int res;
+
+    RLOGD("query_ctec. current: %d, preferred: %d", (int)current, (int) preferred);
+    err = at_send_command_singleline("AT+CTEC?", "+CTEC:", &response);
+    if (!err && response->success) {
+        res = parse_technology_response(response->p_intermediates->line, current, preferred);
+        at_response_free(response);
+        return res;
+    }
+    RLOGE("Error executing command: %d. response: %x. status: %d", err, (int)response, response? response->success : -1);
+    at_response_free(response);
+    return -1;
+}
+
+int is_multimode_modem(ModemInfo *mdm)
+{
+    ATResponse *response;
+    int err;
+    char *line;
+    int tech;
+    int32_t preferred;
+
+    if (query_ctec(mdm, &tech, &preferred) == 0) {
+        mdm->currentTech = tech;
+        mdm->preferredNetworkMode = preferred;
+        if (query_supported_techs(mdm, &mdm->supportedTechs)) {
+            return 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * Find out if our modem is GSM, CDMA or both (Multimode)
+ */
+static void probeForModemMode(ModemInfo *info)
+{
+    ATResponse *response;
+    int err;
+    assert (info);
+    // Currently, our only known multimode modem is qemu's android modem,
+    // which implements the AT+CTEC command to query and set mode.
+    // Try that first
+
+    if (is_multimode_modem(info)) {
+        RLOGI("Found Multimode Modem. Supported techs mask: %8.8x. Current tech: %d",
+            info->supportedTechs, info->currentTech);
+        return;
+    }
+
+    /* Being here means that our modem is not multimode */
+    info->isMultimode = 0;
+
+    /* CDMA Modems implement the AT+WNAM command */
+    err = at_send_command_singleline("AT+WNAM","+WNAM:", &response);
+    if (!err && response->success) {
+        at_response_free(response);
+        // TODO: find out if we really support EvDo
+        info->supportedTechs = MDM_CDMA | MDM_EVDO;
+        info->currentTech = MDM_CDMA;
+        RLOGI("Found CDMA Modem");
+        return;
+    }
+    if (!err) at_response_free(response);
+    // TODO: find out if modem really supports WCDMA/LTE
+    info->supportedTechs = MDM_GSM | MDM_WCDMA | MDM_LTE;
+    info->currentTech = MDM_GSM;
+    RLOGI("Found GSM Modem");
+}
+
+/**
  * Initialize everything that can be configured while we're still in
  * AT+CFUN=0
  */
@@ -1806,6 +2782,7 @@ static void initializeCallback(void *param)
 
     at_handshake();
 
+    probeForModemMode(sMdmInfo);
     /* note: we don't check errors here. Everything important will
        be handled in onATTimeout and onATReaderClosed */
 
@@ -1871,7 +2848,7 @@ static void initializeCallback(void *param)
 
     /* assume radio is off on error */
     if (isRadioOn() > 0) {
-        setRadioState (RADIO_STATE_SIM_NOT_READY);
+        setRadioState (RADIO_STATE_ON);
     }
 }
 
@@ -1893,7 +2870,7 @@ static void waitForClose()
  */
 static void onUnsolicited (const char *s, const char *sms_pdu)
 {
-    char *line = NULL;
+    char *line = NULL, *p;
     int err;
 
     /* Ignore unsolicited responses until we're initialized.
@@ -1907,13 +2884,14 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         /* TI specific -- NITZ time */
         char *response;
 
-        line = strdup(s);
-        at_tok_start(&line);
+        line = p = strdup(s);
+        at_tok_start(&p);
 
-        err = at_tok_nextstr(&line, &response);
+        err = at_tok_nextstr(&p, &response);
 
+        free(line);
         if (err != 0) {
-            LOGE("invalid NITZ line %s\n", s);
+            RLOGE("invalid NITZ line %s\n", s);
         } else {
             RIL_onUnsolicitedResponse (
                 RIL_UNSOL_NITZ_TIME_RECEIVED,
@@ -1934,7 +2912,7 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
                 || strStartsWith(s,"+CGREG:")
     ) {
         RIL_onUnsolicitedResponse (
-            RIL_UNSOL_RESPONSE_NETWORK_STATE_CHANGED,
+            RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,
             NULL, 0);
 #ifdef WORKAROUND_FAKE_CGEV
         RIL_requestTimedCallback (onDataCallListChanged, NULL, NULL);
@@ -1958,13 +2936,95 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
     } else if (strStartsWith(s, "+CME ERROR: 150")) {
         RIL_requestTimedCallback (onDataCallListChanged, NULL, NULL);
 #endif /* WORKAROUND_FAKE_CGEV */
+    } else if (strStartsWith(s, "+CTEC: ")) {
+        int tech, mask;
+        switch (parse_technology_response(s, &tech, NULL))
+        {
+            case -1: // no argument could be parsed.
+                RLOGE("invalid CTEC line %s\n", s);
+                break;
+            case 1: // current mode correctly parsed
+            case 0: // preferred mode correctly parsed
+                mask = 1 << tech;
+                if (mask != MDM_GSM && mask != MDM_CDMA &&
+                     mask != MDM_WCDMA && mask != MDM_LTE) {
+                    RLOGE("Unknown technology %d\n", tech);
+                } else {
+                    setRadioTechnology(sMdmInfo, tech);
+                }
+                break;
+        }
+    } else if (strStartsWith(s, "+CCSS: ")) {
+        int source = 0;
+        line = p = strdup(s);
+        if (!line) {
+            RLOGE("+CCSS: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &source) < 0) {
+            RLOGE("invalid +CCSS response: %s", line);
+            free(line);
+            return;
+        }
+        SSOURCE(sMdmInfo) = source;
+        RIL_onUnsolicitedResponse(RIL_UNSOL_CDMA_SUBSCRIPTION_SOURCE_CHANGED,
+                                  &source, sizeof(source));
+    } else if (strStartsWith(s, "+WSOS: ")) {
+        char state = 0;
+        int unsol;
+        line = p = strdup(s);
+        if (!line) {
+            RLOGE("+WSOS: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            free(line);
+            return;
+        }
+        if (at_tok_nextbool(&p, &state) < 0) {
+            RLOGE("invalid +WSOS response: %s", line);
+            free(line);
+            return;
+        }
+        free(line);
+
+        unsol = state ?
+                RIL_UNSOL_ENTER_EMERGENCY_CALLBACK_MODE : RIL_UNSOL_EXIT_EMERGENCY_CALLBACK_MODE;
+
+        RIL_onUnsolicitedResponse(unsol, NULL, 0);
+
+    } else if (strStartsWith(s, "+WPRL: ")) {
+        int version = -1;
+        line = p = strdup(s);
+        if (!line) {
+            RLOGE("+WPRL: Unable to allocate memory");
+            return;
+        }
+        if (at_tok_start(&p) < 0) {
+            RLOGE("invalid +WPRL response: %s", s);
+            free(line);
+            return;
+        }
+        if (at_tok_nextint(&p, &version) < 0) {
+            RLOGE("invalid +WPRL response: %s", s);
+            free(line);
+            return;
+        }
+        free(line);
+        RIL_onUnsolicitedResponse(RIL_UNSOL_CDMA_PRL_CHANGED, &version, sizeof(version));
+    } else if (strStartsWith(s, "+CFUN: 0")) {
+        setRadioState(RADIO_STATE_OFF);
     }
 }
 
 /* Called on command or reader thread */
 static void onATReaderClosed()
 {
-    LOGI("AT channel closed\n");
+    RLOGI("AT channel closed\n");
     at_close();
     s_closed = 1;
 
@@ -1974,7 +3034,7 @@ static void onATReaderClosed()
 /* Called on command thread */
 static void onATTimeout()
 {
-    LOGI("AT channel timeout; closing\n");
+    RLOGI("AT channel timeout; closing\n");
     at_close();
 
     s_closed = 1;
@@ -2011,21 +3071,28 @@ mainLoop(void *param)
                 fd = socket_loopback_client(s_port, SOCK_STREAM);
             } else if (s_device_socket) {
                 if (!strcmp(s_device_path, "/dev/socket/qemud")) {
-                    /* Qemu-specific control socket */
-                    fd = socket_local_client( "qemud",
-                                              ANDROID_SOCKET_NAMESPACE_RESERVED,
-                                              SOCK_STREAM );
-                    if (fd >= 0 ) {
-                        char  answer[2];
+                    /* Before trying to connect to /dev/socket/qemud (which is
+                     * now another "legacy" way of communicating with the
+                     * emulator), we will try to connecto to gsm service via
+                     * qemu pipe. */
+                    fd = qemu_pipe_open("qemud:gsm");
+                    if (fd < 0) {
+                        /* Qemu-specific control socket */
+                        fd = socket_local_client( "qemud",
+                                                  ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                                  SOCK_STREAM );
+                        if (fd >= 0 ) {
+                            char  answer[2];
 
-                        if ( write(fd, "gsm", 3) != 3 ||
-                             read(fd, answer, 2) != 2 ||
-                             memcmp(answer, "OK", 2) != 0)
-                        {
-                            close(fd);
-                            fd = -1;
-                        }
-                   }
+                            if ( write(fd, "gsm", 3) != 3 ||
+                                 read(fd, answer, 2) != 2 ||
+                                 memcmp(answer, "OK", 2) != 0)
+                            {
+                                close(fd);
+                                fd = -1;
+                            }
+                       }
+                    }
                 }
                 else
                     fd = socket_local_client( s_device_path,
@@ -2053,7 +3120,7 @@ mainLoop(void *param)
         ret = at_open(fd, onUnsolicited);
 
         if (ret < 0) {
-            LOGE ("AT error %d on at_open\n", ret);
+            RLOGE ("AT error %d on at_open\n", ret);
             return 0;
         }
 
@@ -2064,7 +3131,7 @@ mainLoop(void *param)
         sleep(1);
 
         waitForClose();
-        LOGI("Re-opening after close");
+        RLOGI("Re-opening after close");
     }
 }
 
@@ -2089,18 +3156,18 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
                     usage(argv[0]);
                     return NULL;
                 }
-                LOGI("Opening loopback port %d\n", s_port);
+                RLOGI("Opening loopback port %d\n", s_port);
             break;
 
             case 'd':
                 s_device_path = optarg;
-                LOGI("Opening tty device %s\n", s_device_path);
+                RLOGI("Opening tty device %s\n", s_device_path);
             break;
 
             case 's':
                 s_device_path   = optarg;
                 s_device_socket = 1;
-                LOGI("Opening socket %s\n", s_device_path);
+                RLOGI("Opening socket %s\n", s_device_path);
             break;
 
             default:
@@ -2114,6 +3181,11 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
         return NULL;
     }
 
+    sMdmInfo = calloc(1, sizeof(ModemInfo));
+    if (!sMdmInfo) {
+        RLOGE("Unable to alloc memory for ModemInfo");
+        return NULL;
+    }
     pthread_attr_init (&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     ret = pthread_create(&s_tid_mainloop, &attr, mainLoop, NULL);
@@ -2134,18 +3206,18 @@ int main (int argc, char **argv)
                 if (s_port == 0) {
                     usage(argv[0]);
                 }
-                LOGI("Opening loopback port %d\n", s_port);
+                RLOGI("Opening loopback port %d\n", s_port);
             break;
 
             case 'd':
                 s_device_path = optarg;
-                LOGI("Opening tty device %s\n", s_device_path);
+                RLOGI("Opening tty device %s\n", s_device_path);
             break;
 
             case 's':
                 s_device_path   = optarg;
                 s_device_socket = 1;
-                LOGI("Opening socket %s\n", s_device_path);
+                RLOGI("Opening socket %s\n", s_device_path);
             break;
 
             default:

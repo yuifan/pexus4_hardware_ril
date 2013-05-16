@@ -2,19 +2,13 @@ Mock-ril:
 
 Install:
 
-Install protoc see the external/protobuf/INSTALL.txt and
-external/protobuf/python/README.txt. The short answer is:
-
-    $ cd external/protobuf
-    $ ./configure
-    $ make
-    $ make check
-    $ make install
-    $ cd python
-    $ python setup.py install
-
-If you get "from google.protobuf import xxxx" statements
-that google.protobuf is not found you didn't install the
+The protoc is now part of the Android build but its
+called "aprotoc" so it doesn't conflict with versions
+already installed. If you wish to install it permanetly
+see external/protobuf/INSTALL.txt and
+external/protobuf/python/README.txt.  If you get
+"from google.protobuf import xxxx" statements that
+google.protobuf is not found, you didn't install the
 python support for protobuf. Also on Mac OSX I got an
 error running the protoc tests but installing was fine.
 
@@ -22,7 +16,16 @@ Running/testing:
 
 See "Testing a new ril:" below for general instructions but
 for the mock-ril I've added some targets to the Makefile to
-ease testing.
+ease testing. Also Makefile needs to know the device being
+used as this determines the directory where files are found
+and stored. ANDROID_DEVICE is an environment variable and
+maybe either exported:
+   $ export ANDROID_DEVICE=stingray
+
+or it can be passed on the command line:
+   $ make clean ANDROID_DEVICE=stingray
+
+If it's not set "passion" is the default.
 
 Execute the "first" target first to setup appropriate
 environment:
@@ -92,7 +95,7 @@ TODO: more documentation.
 Testing a new ril:
 
 The Makefile is used to generate files and make testing easier.
-I has several targets:
+and there are has several targets:
 
 all         runs protoc and generates files, ril.desc ril.pb.*
 
@@ -129,5 +132,9 @@ General instructions for testing ril's:
      radio     3212  1     3224   628   ffffffff afd0e4fc S /system/bin/rild
 
      $ adb shell kill 3212
+
+   or
+
+     $ adb shell setprop ctl.restart ril-daemon
 
 5) Make modifications, go to step 3.
